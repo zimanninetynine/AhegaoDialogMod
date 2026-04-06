@@ -6,6 +6,7 @@ static std::vector<RE::TESObjectARMO*> g_armors;
 static std::atomic<bool> g_dialogueActive{ false };
 static float g_chanceToActivate = 20.0f;
 static bool g_onlyFemale = true;
+static bool g_unequipSlotOnAhegaoStart = true;
 
 class DialogueEventSink :
 	public RE::BSTEventSink<RE::MenuOpenCloseEvent>
@@ -120,13 +121,17 @@ public:
 		auto armorSlot = static_cast<RE::BGSBipedObjectForm::BipedObjectSlot>(currentArmor->GetSlotMask());
 		auto* currentlyWorn = npc->GetWornArmor(armorSlot);
 
-		if (currentlyWorn) {
-			/*
-			lastArmorUnequipped = currentlyWorn;
-			equipManager->UnequipObject(npc, currentlyWorn, nullptr, 1, equipSlot,
-				false, true, false, true, nullptr);
-				*/
-			return;
+		if(currentlyWorn)
+		{
+			if (g_unequipSlotOnAhegaoStart)
+			{
+				lastArmorUnequipped = currentlyWorn;
+				equipManager->UnequipObject(npc, currentlyWorn, nullptr, 1, equipSlot, false, true, false, true, nullptr);
+			}
+			else
+			{
+				return;
+			}
 		}
 
 		StartAhegaoEquipTongue(npc, equipManager, equipSlot);
@@ -359,6 +364,7 @@ void LoadSettings()
 
 	g_chanceToActivate = static_cast<float>(ini.GetDoubleValue("General", "fChanceToActivate", 20.0));
 	g_onlyFemale = static_cast<bool>(ini.GetBoolValue("General", "bOnlyFemale", true));
+	g_unequipSlotOnAhegaoStart = static_cast<bool>(ini.GetBoolValue("General", "bUnequipSlotOnAhegaoStart", true));
 
 	//SKSE::log::info("Conf : {}", g_onlyFemale);
 }
