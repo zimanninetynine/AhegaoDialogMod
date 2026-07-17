@@ -1,12 +1,50 @@
 #include "log.h"
 #include <future>
+#include <mutex>
+#include <unordered_map>
 #include <SimpleIni.h>
 
 static std::vector<RE::TESObjectARMO*> g_armors;
-static std::atomic<bool> g_dialogueActive{ false };
 static float g_chanceToActivate = 20.0f;
 static bool g_onlyFemale = true;
 static bool g_unequipSlotOnAhegaoStart = true;
+
+struct TongueState {
+	RE::TESObjectARMO* currentArmor = nullptr;
+	RE::TESObjectARMO* lastArmorUnequipped = nullptr;
+	bool dialogueActive = false;
+};
+
+static std::mutex g_stateMutex;
+static std::unordered_map<RE::FormID, TongueState> g_tongueStates;
+
+TongueState& GetState(RE::FormID id)
+{
+	std::lock_guard lock(g_stateMutex);
+	return g_tongueStates[id];
+}
+
+void ClearState(RE::FormID id)
+{
+	std::lock_guard lock(g_stateMutex);
+	g_tongueStates.erase(id);
+}
+
+bool IsDialogueActive(RE::FormID id)
+{
+	std::lock_guard lock(g_stateMutex);
+	auto it = g_tongueStates.find(id);
+	return it != g_tongueStates.end() && it->second.dialogueActive;
+}
+
+void SetDialogueActive(RE::FormID id, bool active)
+{
+	std::lock_guard lock(g_stateMutex);
+	auto it = g_tongueStates.find(id);
+	if (it != g_tongueStates.end()) {
+		it->second.dialogueActive = active;
+	}
+}
 
 class DialogueEventSink :
 	public RE::BSTEventSink<RE::MenuOpenCloseEvent>
@@ -18,20 +56,24 @@ public:
 		return &instance;
 	}
 
-	RE::TESObjectARMO* currentArmor = nullptr;
-	RE::TESObjectARMO* lastArmorUnequipped = nullptr;
-
 	void AhegaoWhenNPCNotTalking(RE::ActorHandle npcHandle)
 	{
+		auto* npc0 = npcHandle.get().get();
+		if (!npc0) return;
+		const RE::FormID id = npc0->GetFormID();
+
+		auto& state = GetState(id);
+		state.dialogueActive = true;
+
 		if (!g_armors.empty())
 		{
 			std::random_device rd;
 			std::mt19937 gen(rd());
 			std::uniform_int_distribution<size_t> dist(0, g_armors.size() - 1);
-			currentArmor = g_armors[dist(gen)];
+			state.currentArmor = g_armors[dist(gen)];
 		}
 
-		std::thread([this, npcHandle]() {
+		std::thread([this, npcHandle, id]() {
 			// Initial delay of 1 second before starting to poll
 			std::this_thread::sleep_for(std::chrono::seconds(1));
 
@@ -44,7 +86,7 @@ public:
 			bool firstPoll = true;
 
 			for (int i = 0; i < kMaxAttempts; ++i) {
-				if (!g_dialogueActive.load(std::memory_order_relaxed)) {
+				if (!IsDialogueActive(id)) {
 					break;
 				}
 
@@ -55,7 +97,7 @@ public:
 				if (!taskInterface) break;
 
 				// Read if talking to player safely on the game thread
-				taskInterface->AddTask([npcHandle, promise]() { //&promise
+				taskInterface->AddTask([npcHandle, promise]() {
 					auto* npc = npcHandle.get().get();
 					if (!npc) {
 						promise->set_value(false);
@@ -112,20 +154,21 @@ public:
 	{
 		if (!npc) return;
 
-		if (!currentArmor) return;
+		auto& state = GetState(npc->GetFormID());
+		if (!state.currentArmor) return;
 
 		auto* equipManager = RE::ActorEquipManager::GetSingleton();
 		if (!equipManager) return;
 
-		auto* equipSlot = currentArmor->GetEquipSlot();
-		auto armorSlot = static_cast<RE::BGSBipedObjectForm::BipedObjectSlot>(currentArmor->GetSlotMask());
+		auto* equipSlot = state.currentArmor->GetEquipSlot();
+		auto armorSlot = static_cast<RE::BGSBipedObjectForm::BipedObjectSlot>(state.currentArmor->GetSlotMask());
 		auto* currentlyWorn = npc->GetWornArmor(armorSlot);
 
-		if(currentlyWorn)
+		if (currentlyWorn)
 		{
 			if (g_unequipSlotOnAhegaoStart)
 			{
-				lastArmorUnequipped = currentlyWorn;
+				state.lastArmorUnequipped = currentlyWorn;
 				equipManager->UnequipObject(npc, currentlyWorn, nullptr, 1, equipSlot, false, true, false, true, nullptr);
 			}
 			else
@@ -134,14 +177,14 @@ public:
 			}
 		}
 
-		StartAhegaoEquipTongue(npc, equipManager, equipSlot);
+		StartAhegaoEquipTongue(npc, equipManager, equipSlot, state.currentArmor);
 		StartAhegaoMfg(npc);
 	}
 
-	void StartAhegaoEquipTongue(RE::Actor* npc, auto* equipManager, auto* equipSlot)
+	void StartAhegaoEquipTongue(RE::Actor* npc, auto* equipManager, auto* equipSlot, RE::TESObjectARMO* armor)
 	{
-		npc->AddObjectToContainer(currentArmor, nullptr, 1, nullptr);
-		equipManager->EquipObject(npc, currentArmor, nullptr, 1, equipSlot,
+		npc->AddObjectToContainer(armor, nullptr, 1, nullptr);
+		equipManager->EquipObject(npc, armor, nullptr, 1, equipSlot,
 			false, true, false, true);
 	}
 
@@ -238,31 +281,39 @@ public:
 
 	void EndAhegaoUnequipTongue(RE::Actor* npc, bool clearGlobalTongue)
 	{
-		if (currentArmor)
+		const RE::FormID id = npc->GetFormID();
+		auto& state = GetState(id);
+
+		if (state.currentArmor)
 		{
 			auto* equipManager = RE::ActorEquipManager::GetSingleton();
 			if (equipManager) {
-				equipManager->UnequipObject(npc, currentArmor, nullptr, 1, nullptr,
+				equipManager->UnequipObject(npc, state.currentArmor, nullptr, 1, nullptr,
 					true, true, true, true);
 			}
-			npc->RemoveItem(currentArmor, 1, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr);
+			npc->RemoveItem(state.currentArmor, 1, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr);
 
-			if (lastArmorUnequipped && equipManager)
+			if (state.lastArmorUnequipped && equipManager)
 			{
-				if (std::find(g_armors.begin(), g_armors.end(), lastArmorUnequipped) == g_armors.end())
+				if (std::find(g_armors.begin(), g_armors.end(), state.lastArmorUnequipped) == g_armors.end())
 				{
-					auto* equipSlot = currentArmor->GetEquipSlot();
-					equipManager->EquipObject(npc, lastArmorUnequipped, nullptr, 1, equipSlot,
+					auto* equipSlot = state.currentArmor->GetEquipSlot();
+					equipManager->EquipObject(npc, state.lastArmorUnequipped, nullptr, 1, equipSlot,
 						false, true, false, true);
 				}
 
-				lastArmorUnequipped = nullptr;
+				state.lastArmorUnequipped = nullptr;
 			}
 
 			if (clearGlobalTongue)
 			{
-				currentArmor = nullptr;
+				state.currentArmor = nullptr;
 			}
+		}
+
+		if (clearGlobalTongue)
+		{
+			ClearState(id);
 		}
 	}
 
@@ -340,12 +391,11 @@ public:
 
 		if (a_event->opening)
 		{
-			g_dialogueActive.store(true, std::memory_order_relaxed);
 			AhegaoWhenNPCNotTalking(npc->GetHandle());
 		}
 		else
 		{
-			g_dialogueActive.store(false, std::memory_order_relaxed);
+			SetDialogueActive(npc->GetFormID(), false);
 			EndAhegao(npc, true);
 		}
 
